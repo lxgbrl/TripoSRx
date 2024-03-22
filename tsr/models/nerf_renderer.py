@@ -38,6 +38,51 @@ class TriplaneNeRFRenderer(BaseModule):
         ), "chunk_size must be a non-negative integer (0 for no chunking)."
         self.chunk_size = chunk_size
 
+    def interpolate_triplane(self, triplane: torch.Tensor, resolution: int):
+        coords = torch.linspace(-1.0, 1.0, resolution, device = triplane.device)
+        x, y = torch.meshgrid(coords, coords, indexing="ij")
+        verts2D = torch.cat([x.view(resolution, resolution,1), y.view(resolution, resolution,1)], dim = -1)
+        verts2D = verts2D.expand(3, -1, -1, -1)
+        return F.grid_sample(triplane, verts2D, align_corners=False,mode="bilinear") # [3 40 H W] xy xz yz
+    def block_based_marchingcube(self, decoder: torch.nn.Module, triplane: torch.Tensor, resolution: int, threshold, block_resolution = 128) -> torch.Tensor:
+        resolution += 1 # sample 1 more line of density, 1024 + 1 == 1025, 0 mapping to -1.0f, 512 mapping to 0.0f, 1025 mapping to 1.0f,  for better floating point precision.
+        block_size = 2.0 * block_resolution / (resolution - 1)
+        voxel_size = block_size / block_resolution
+        interpolated = self.interpolate_triplane(triplane, resolution)
+        pos_list = []
+        indices_list = []
+        color_list = []
+
+        for x in range(0, resolution - 1, block_resolution):
+            size_x = resolution - x if x + block_resolution >= resolution else block_resolution + 1 # sample 1 more line of density, so marching cubes resolution match block_resolution
+            for y in range(0, resolution - 1, block_resolution):
+                size_y = resolution - y if y + block_resolution >= resolution else block_resolution + 1
+                for z in range(0, resolution - 1, block_resolution):
+                    size_z = resolution - z if z + block_resolution >= resolution else block_resolution + 1
+                    xyplane = interpolated[0:1, :, x:x+size_x, y:y+size_y].expand(size_z, -1, -1, -1, -1).permute(3, 4, 0, 1, 2)
+                    xzplane = interpolated[1:2, :, x:x+size_x, z:z+size_z].expand(size_y, -1, -1, -1, -1).permute(3, 0, 4, 1, 2)
+
+                    density = get_activation(self.cfg.density_activation)(density + self.cfg.density_bias)
+
+                    # now do the marching cube
+                    v_pos, indices = marching_cubes(density.view(size_x, size_y, size_z).detach(), threshold)
+
+                    #count = indices.size(0)
+                    #if count == 0:
+                    #    continue
+                    offset = torch.tensor([x * voxel_size - 1.0, y * voxel_size - 1.0, z * voxel_size - 1.0], device = triplane.device)
+                    v_pos = v_pos[..., [2, 1, 0]] * voxel_size + offset
+                    v_color = self.query_triplane(decoder, v_pos, triplane, False)["color"]
+                    indices_list.append(indices)
+                    pos_list.append(v_pos)
+                    color_list.append(v_color)
+        
+        vertex_count = 0
+        for i in range(0, len(pos_list)):
+            indices_list[i] += vertex_count
+            vertex_count += pos_list[i].size(0)
+        return torch.cat(pos_list), torch.cat(color_list), torch.cat(indices_list)
+    
     def make_step_grid(self,device, resolution: int, chunk_size: int = 32):
         coords = torch.linspace(-1.0, 1.0, resolution, device = device)
         x, y, z = torch.meshgrid(coords[0:chunk_size], coords, coords, indexing="ij")
